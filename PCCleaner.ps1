@@ -38,6 +38,21 @@ $Protected = @(
     (Join-Path $LocalApp 'Temp\claude')
 ) | ForEach-Object { $_.TrimEnd('\').ToLowerInvariant() }
 
+# Real space a file takes on disk. Some Windows caches use "sparse" files whose
+# listed size is far bigger than what they actually occupy, so Length alone lies.
+if (-not ('PCCleaner.Disk' -as [type])) {
+    Add-Type -Namespace PCCleaner -Name Disk -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint GetCompressedFileSizeW(string lpFileName, out uint lpFileSizeHigh);
+'@
+}
+function Get-DiskSize([IO.FileInfo]$file) {
+    $high = [uint32]0
+    $low = [PCCleaner.Disk]::GetCompressedFileSizeW($file.FullName, [ref]$high)
+    if ($low -eq [uint32]::MaxValue -and [Runtime.InteropServices.Marshal]::GetLastWin32Error() -ne 0) { return $file.Length }
+    return ([int64]$high -shl 32) + $low
+}
+
 function Format-Size([double]$bytes) {
     if ($bytes -ge 1GB) { '{0:N2} GB' -f ($bytes / 1GB) }
     elseif ($bytes -ge 1MB) { '{0:N0} MB' -f ($bytes / 1MB) }
@@ -68,7 +83,7 @@ function Measure-Folder([string]$path) {
             foreach ($c in $children) {
                 if (Test-Link $c) { continue }
                 if ($c -is [IO.DirectoryInfo]) { $stack.Push($c) }
-                elseif ($c.LastWriteTime -lt $Cutoff) { $size += $c.Length; $count++ }
+                elseif ($c.LastWriteTime -lt $Cutoff) { $size += (Get-DiskSize $c); $count++ }
             }
         } catch { }
     }
@@ -93,7 +108,7 @@ function Clear-Folder([string]$path) {
             if ($c -is [IO.DirectoryInfo]) { $stack.Push($c); $dirs.Add($c) }
             elseif ($c.LastWriteTime -lt $Cutoff) {
                 try {
-                    $len = $c.Length
+                    $len = Get-DiskSize $c
                     if ($c.IsReadOnly) { $c.IsReadOnly = $false }
                     $c.Delete(); $freed += $len
                 } catch { }
@@ -152,7 +167,7 @@ function Measure-Category($cat) {
     foreach ($p in $cat.Paths) {
         if ($cat.Filter) {
             foreach ($f in $cat.Filter) {
-                Get-ChildItem -LiteralPath $p -Filter $f -File -Force | ForEach-Object { $size += $_.Length; $count++ }
+                Get-ChildItem -LiteralPath $p -Filter $f -File -Force | ForEach-Object { $size += (Get-DiskSize $_); $count++ }
             }
         } else {
             $r = Measure-Folder $p; $size += $r[0]; $count += $r[1]
@@ -167,7 +182,7 @@ function Clear-Category($cat) {
         if ($cat.Filter) {
             foreach ($f in $cat.Filter) {
                 Get-ChildItem -LiteralPath $p -Filter $f -File -Force | ForEach-Object {
-                    $len = $_.Length; try { $_.Delete(); $freed += $len } catch { }
+                    $len = Get-DiskSize $_; try { $_.Delete(); $freed += $len } catch { }
                 }
             }
         } else { $freed += Clear-Folder $p }
@@ -280,9 +295,16 @@ foreach ($r in $results) {
     if ($r.Size -le 0) { continue }
     if ($r.Cat.Admin -and -not $isAdmin) { Write-Host ("  Skipped {0} (needs administrator)" -f $r.Cat.Name); continue }
     if (Confirm-Step ("  Clean {0} ({1})?" -f $r.Cat.Name, (Format-Size $r.Size))) {
-        if ($r.Cat.Name -like 'Windows Update*') { Stop-Service wuauserv, bits -Force }
-        $freed = Clear-Category $r.Cat
-        if ($r.Cat.Name -like 'Windows Update*') { Start-Service wuauserv, bits }
+        $cBefore = (Get-PSDrive C).Free
+        if ($r.Cat.Name -like 'Delivery Optimization*' -and (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue)) {
+            # Windows' own command: clears the cache safely while the service is running.
+            Delete-DeliveryOptimizationCache -Force -ErrorAction SilentlyContinue
+            $freed = [math]::Max(0, (Get-PSDrive C).Free - $cBefore)
+        } else {
+            if ($r.Cat.Name -like 'Windows Update*') { Stop-Service wuauserv -Force -WarningAction SilentlyContinue }
+            $freed = Clear-Category $r.Cat
+            if ($r.Cat.Name -like 'Windows Update*') { Start-Service wuauserv -WarningAction SilentlyContinue }
+        }
         Write-Host ("    freed {0}" -f (Format-Size $freed)) -ForegroundColor Green
     }
 }
